@@ -24,6 +24,22 @@ Rectangle {
   Layout.minimumWidth: 200
   Layout.minimumHeight: 200
   anchors.fill: parent
+  color: "transparent"
+
+  function makeViewportAncestorsTransparent(item) {
+    var current = item
+    while (current !== undefined && current !== null) {
+      if (current.color !== undefined)
+        current.color = "transparent"
+
+      if (current.objectName !== undefined &&
+          current.objectName.toString().indexOf("split_item_") === 0) {
+        break
+      }
+
+      current = current.parent
+    }
+  }
 
   /**
    * Get mouse position on 3D widget
@@ -56,6 +72,8 @@ Rectangle {
 
       width = Qt.binding(function() {return parent.parent.width})
       height = Qt.binding(function() {return parent.parent.height})
+
+      makeViewportAncestorsTransparent(parent)
   }
 
   DropArea {

@@ -151,6 +151,12 @@ namespace gz::gui::plugins
     /// \param[in] _graphicsAPI The type of graphics API
     public: void SetGraphicsAPI(const rendering::GraphicsAPI &_graphicsAPI);
 
+    /// \brief Set externally provided Wayland handles for native embedding.
+    /// These are only used by the experimental native Wayland path.
+    /// \param[in] _display Native wl_display handle, or nullptr to clear.
+    /// \param[in] _surface Native wl_surface handle, or nullptr to clear.
+    public: void SetExternalWaylandHandles(void *_display, void *_surface);
+
     /// \brief Destroy camera associated with this renderer
     public: void Destroy();
 
@@ -311,11 +317,20 @@ namespace gz::gui::plugins
     /// On macOS this must be run on the main thread
     public: std::string Initialize();
 
+    /// \brief Enable or disable continuous self-scheduled rendering.
+    /// This is used by the experimental native Wayland path, where there is
+    /// no Qt texture node to drive the render loop.
+    /// \param[in] _enable True to keep scheduling frames.
+    public: void SetContinuousRendering(bool _enable);
+
     /// \brief gz-rendering renderer
     public: GzRenderer gzRenderer;
 
     /// \brief Pointer to render interface to handle OpenGL/Metal compatibility
     private: std::unique_ptr<RenderThreadRhi> rhi;
+
+    /// \brief True when the thread should keep scheduling RenderNext itself.
+    private: bool continuousRendering = false;
   };
 
   /// \brief A QQUickItem that manages the render window
@@ -405,6 +420,10 @@ namespace gz::gui::plugins
 
     /// \brief Stop rendering and shutdown resources.
     public: void StopRendering();
+
+    /// \brief Starts the experimental native Wayland render path without
+    /// relying on the Qt scene graph texture-node bootstrap.
+    public slots: void StartExperimentalNativeWayland();
 
     // Documentation inherited
     protected: virtual void mousePressEvent(QMouseEvent *_e) override;

@@ -84,12 +84,19 @@ set(GZ_TOOLS_VER 2)
 gz_find_package (Qt5
   COMPONENTS
     Core
+    Gui
     Quick
     QuickControls2
     Widgets
   REQUIRED
-  PKGCONFIG "Qt5Core Qt5Quick Qt5QuickControls2 Qt5Widgets"
+  PKGCONFIG "Qt5Core Qt5Gui Qt5Quick Qt5QuickControls2 Qt5Widgets"
 )
+
+#--------------------------------------
+# Find optional Qt Wayland client support for native Wayland integrations.
+# Keep this optional so the normal X11/Xcb path remains buildable everywhere.
+find_package(Qt5WaylandClient QUIET)
+find_package(Qt5WaylandClient QUIET COMPONENTS Private)
 
 set(GZ_GUI_PLUGIN_RELATIVE_INSTALL_DIR
   ${GZ_LIB_INSTALL_DIR}/gz-${GZ_DESIGNATION}-${PROJECT_VERSION_MAJOR}/plugins

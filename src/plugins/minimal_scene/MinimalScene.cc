@@ -25,6 +25,8 @@
 #include "MinimalSceneRhiVulkan.hh"
 
 #include <algorithm>
+#include <cmath>
+#include <cstring>
 #include <list>
 #include <map>
 #include <sstream>
@@ -39,6 +41,7 @@
 #include <gz/plugin/Register.hh>
 #include <gz/rendering/config.hh>
 #include <gz/rendering/Camera.hh>
+#include <gz/rendering/NativeWindow.hh>
 #include <gz/rendering/RayQuery.hh>
 #include <gz/rendering/RenderEngine.hh>
 #include <gz/rendering/RenderingIface.hh>
@@ -52,6 +55,13 @@
 #include "gz/gui/Helpers.hh"
 #include "gz/gui/MainWindow.hh"
 
+#include <QtGui/qguiapplication.h>
+#include <QtGui/qpa/qplatformnativeinterface.h>
+
+#ifdef GZ_GUI_HAVE_QT5_WAYLAND_CLIENT
+#include <wayland-client.h>
+#endif
+
 #if QT_VERSION >= QT_VERSION_CHECK(5, 15, 2) && QT_CONFIG(vulkan) && \
     defined(GZ_RENDERING_HAVE_VULKAN)
 #  include <QVulkanInstance>
@@ -62,6 +72,311 @@ Q_DECLARE_METATYPE(gz::gui::plugins::RenderSync*)
 
 namespace gz::gui::plugins
 {
+namespace
+{
+struct NativeWaylandHandles
+{
+  void *display{nullptr};
+  void *surface{nullptr};
+
+  bool Valid() const
+  {
+    return this->display != nullptr && this->surface != nullptr;
+  }
+};
+
+#ifdef GZ_GUI_HAVE_QT5_WAYLAND_CLIENT
+struct WaylandRegistryBinder
+{
+  wl_compositor *compositor{nullptr};
+  wl_subcompositor *subcompositor{nullptr};
+
+  static void Global(void *_data, wl_registry *_registry, uint32_t _name,
+      const char *_interface, uint32_t _version)
+  {
+    auto *self = static_cast<WaylandRegistryBinder *>(_data);
+
+    if (std::strcmp(_interface, wl_compositor_interface.name) == 0)
+    {
+      const uint32_t version = std::min<uint32_t>(_version, 4u);
+      self->compositor = static_cast<wl_compositor *>(
+          wl_registry_bind(_registry, _name, &wl_compositor_interface,
+          version));
+    }
+    else if (std::strcmp(_interface, wl_subcompositor_interface.name) == 0)
+    {
+      self->subcompositor = static_cast<wl_subcompositor *>(
+          wl_registry_bind(_registry, _name, &wl_subcompositor_interface,
+          1u));
+    }
+  }
+
+  static void GlobalRemove(void *, wl_registry *, uint32_t)
+  {
+  }
+};
+
+const wl_registry_listener kWaylandRegistryListener = {
+  &WaylandRegistryBinder::Global,
+  &WaylandRegistryBinder::GlobalRemove
+};
+
+struct WaylandSubsurface
+{
+  wl_display *display{nullptr};
+  wl_surface *parentSurface{nullptr};
+  wl_compositor *compositor{nullptr};
+  wl_subcompositor *subcompositor{nullptr};
+  wl_surface *surface{nullptr};
+  wl_subsurface *subsurface{nullptr};
+  bool placeAboveParent{true};
+
+  bool Create(QQuickWindow *_window, QQuickItem *_item);
+
+  void Sync(QQuickItem *_item);
+
+  void SetPlaceAboveParent(bool _placeAboveParent)
+  {
+    this->placeAboveParent = _placeAboveParent;
+  }
+
+  NativeWaylandHandles Handles() const
+  {
+    NativeWaylandHandles handles;
+    handles.display = this->display;
+    handles.surface = this->surface;
+    return handles;
+  }
+
+  bool Valid() const
+  {
+    return this->display != nullptr && this->surface != nullptr &&
+        this->subsurface != nullptr;
+  }
+
+  void Destroy();
+};
+#endif
+
+/////////////////////////////////////////////////
+bool UseExperimentalNativeWayland()
+{
+  const QByteArray experimental =
+      qgetenv("GZ_EXPERIMENTAL_NATIVE_WAYLAND");
+  const QString platform = QString::fromLocal8Bit(qgetenv("QT_QPA_PLATFORM"));
+  const QString sessionType =
+      QString::fromLocal8Bit(qgetenv("XDG_SESSION_TYPE"));
+  const bool enabled = !experimental.isEmpty() &&
+      platform != "xcb" &&
+      sessionType == "wayland";
+
+  static bool loggedOnce = false;
+  if (!loggedOnce)
+  {
+    gzdbg << "Experimental native Wayland gate:"
+          << " GZ_EXPERIMENTAL_NATIVE_WAYLAND=" << experimental.constData()
+          << " XDG_SESSION_TYPE=" << sessionType.toStdString()
+          << " QT_QPA_PLATFORM=" << platform.toStdString()
+          << " enabled=" << enabled
+          << std::endl;
+    loggedOnce = true;
+  }
+
+  return enabled;
+}
+
+/////////////////////////////////////////////////
+NativeWaylandHandles GetNativeWaylandHandles(QQuickWindow *_window)
+{
+  NativeWaylandHandles handles;
+
+  if (!_window || !UseExperimentalNativeWayland())
+    return handles;
+
+  if (auto *nativeInterface = QGuiApplication::platformNativeInterface())
+  {
+    handles.display =
+        nativeInterface->nativeResourceForIntegration(QByteArrayLiteral("display"));
+    handles.surface =
+        nativeInterface->nativeResourceForWindow(QByteArrayLiteral("surface"),
+                                                _window);
+  }
+
+  return handles;
+}
+
+/////////////////////////////////////////////////
+bool IsPopupLikeObject(const QObject *_object)
+{
+  for (auto current = _object; current != nullptr; current = current->parent())
+  {
+    const QString className =
+        QString::fromLatin1(current->metaObject()->className());
+    const QString objectName = current->objectName();
+
+    if (className.contains("Popup") ||
+        className.contains("Dialog") ||
+        className.contains("Menu") ||
+        className.contains("Drawer") ||
+        className.contains("Overlay") ||
+        objectName.contains("pluginMenu") ||
+        objectName.contains("confirmationDialog") ||
+        objectName.contains("dialog", Qt::CaseInsensitive) ||
+        objectName.contains("drawer", Qt::CaseInsensitive) ||
+        objectName.contains("menu", Qt::CaseInsensitive))
+    {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+#ifdef GZ_GUI_HAVE_QT5_WAYLAND_CLIENT
+bool WaylandSubsurface::Create(QQuickWindow *_window, QQuickItem *_item)
+{
+  this->Destroy();
+
+  const auto parentHandles = GetNativeWaylandHandles(_window);
+  this->display = static_cast<wl_display *>(parentHandles.display);
+  this->parentSurface = static_cast<wl_surface *>(parentHandles.surface);
+
+  if (!this->display || !this->parentSurface)
+  {
+    gzwarn << "WaylandSubsurface::Create missing parent display or surface."
+           << " display=" << this->display
+           << " parentSurface=" << this->parentSurface
+           << std::endl;
+    return false;
+  }
+
+  wl_registry *registry = wl_display_get_registry(this->display);
+  if (!registry)
+  {
+    gzwarn << "WaylandSubsurface::Create failed to get registry."
+           << std::endl;
+    return false;
+  }
+
+  WaylandRegistryBinder binder;
+  wl_registry_add_listener(registry, &kWaylandRegistryListener, &binder);
+  wl_display_roundtrip(this->display);
+  wl_registry_destroy(registry);
+
+  if (!binder.compositor || !binder.subcompositor)
+  {
+    gzwarn << "WaylandSubsurface::Create missing compositor globals."
+           << " compositor=" << binder.compositor
+           << " subcompositor=" << binder.subcompositor
+           << std::endl;
+    if (binder.subcompositor)
+      wl_subcompositor_destroy(binder.subcompositor);
+    if (binder.compositor)
+      wl_compositor_destroy(binder.compositor);
+    return false;
+  }
+
+  this->compositor = binder.compositor;
+  this->subcompositor = binder.subcompositor;
+  this->surface = wl_compositor_create_surface(this->compositor);
+  if (!this->surface)
+  {
+    gzwarn << "WaylandSubsurface::Create failed to create child surface."
+           << std::endl;
+    return false;
+  }
+
+  this->subsurface = wl_subcompositor_get_subsurface(
+      this->subcompositor, this->surface, this->parentSurface);
+  if (!this->subsurface)
+  {
+    gzwarn << "WaylandSubsurface::Create failed to create subsurface."
+           << std::endl;
+    return false;
+  }
+
+  // Keep the Ogre child surface above the parent Qt surface by default so the
+  // viewport remains visible. We temporarily yield this stacking when Qt focus
+  // moves to menus / dialogs / controls outside the viewport item.
+  wl_subsurface_place_above(this->subsurface, this->parentSurface);
+  wl_subsurface_set_desync(this->subsurface);
+
+  // Let Qt keep receiving pointer/keyboard input for the viewport item and
+  // the surrounding GUI. The Ogre child surface is presentation-only here.
+  wl_region *emptyInputRegion = wl_compositor_create_region(this->compositor);
+  if (emptyInputRegion)
+  {
+    wl_surface_set_input_region(this->surface, emptyInputRegion);
+    wl_surface_set_opaque_region(this->surface, emptyInputRegion);
+    wl_region_destroy(emptyInputRegion);
+  }
+
+  this->Sync(_item);
+  wl_surface_commit(this->surface);
+  wl_display_flush(this->display);
+  return true;
+}
+
+void WaylandSubsurface::Sync(QQuickItem *_item)
+{
+  if (!_item || !this->subsurface || !this->surface)
+    return;
+
+  const QPointF topLeft = _item->mapToScene(QPointF(0, 0));
+  double scale = 1.0;
+  if (_item->window())
+    scale = std::max(1.0, _item->window()->effectiveDevicePixelRatio());
+
+  wl_subsurface_set_position(this->subsurface,
+      static_cast<int>(std::lround(topLeft.x() * scale)),
+      static_cast<int>(std::lround(topLeft.y() * scale)));
+  if (this->placeAboveParent)
+    wl_subsurface_place_above(this->subsurface, this->parentSurface);
+  else
+    wl_subsurface_place_below(this->subsurface, this->parentSurface);
+
+  wl_region *emptyInputRegion = wl_compositor_create_region(this->compositor);
+  if (emptyInputRegion)
+  {
+    wl_surface_set_input_region(this->surface, emptyInputRegion);
+    wl_surface_set_opaque_region(this->surface, emptyInputRegion);
+    wl_region_destroy(emptyInputRegion);
+  }
+
+  wl_surface_commit(this->surface);
+  if (this->display)
+    wl_display_flush(this->display);
+}
+
+void WaylandSubsurface::Destroy()
+{
+  if (this->subsurface)
+  {
+    wl_subsurface_destroy(this->subsurface);
+    this->subsurface = nullptr;
+  }
+  if (this->surface)
+  {
+    wl_surface_destroy(this->surface);
+    this->surface = nullptr;
+  }
+  if (this->subcompositor)
+  {
+    wl_subcompositor_destroy(this->subcompositor);
+    this->subcompositor = nullptr;
+  }
+  if (this->compositor)
+  {
+    wl_compositor_destroy(this->compositor);
+    this->compositor = nullptr;
+  }
+
+  this->parentSurface = nullptr;
+  this->display = nullptr;
+}
+#endif
+}
+
 /// \brief Private data class for GzRenderer
 class GzRenderer::Implementation
 {
@@ -96,6 +411,10 @@ class GzRenderer::Implementation
 
   /// \brief User camera
   public: rendering::CameraPtr camera{nullptr};
+
+  /// \brief Native window used to present frames in the experimental
+  /// native Wayland path.
+  public: rendering::NativeWindowPtr nativeWindow{nullptr};
 
   /// \brief The currently hovered mouse position in screen coordinates
   public: math::Vector2i mouseHoverPos{math::Vector2i::Zero};
@@ -233,6 +552,12 @@ class gz::gui::plugins::RenderWindowItem::Implementation
 
   /// \brief List of our QT connections.
   public: QList<QMetaObject::Connection> connections;
+
+#ifdef GZ_GUI_HAVE_QT5_WAYLAND_CLIENT
+  /// \brief Wayland child subsurface used to embed Ogre output without
+  /// creating a second toplevel window.
+  public: std::unique_ptr<WaylandSubsurface> waylandSubsurface;
+#endif
 };
 
 /// \brief Private data class for MinimalScene
@@ -323,8 +648,20 @@ GzRenderer::GzRenderer()
 void GzRenderer::Render(RenderSync *_renderSync,
                         RenderThreadRhi &_renderThreadRhi)
 {
-  std::unique_lock<std::mutex> lock(_renderSync->mutex);
-  _renderSync->WaitForQtThreadAndBlock(lock);
+  const bool nativeWayland = UseExperimentalNativeWayland();
+  std::unique_lock<std::mutex> lock;
+  if (!nativeWayland)
+  {
+    if (!_renderSync)
+    {
+      gzerr << "RenderSync is required for the embedded Qt render path."
+            << std::endl;
+      return;
+    }
+
+    lock = std::unique_lock<std::mutex>(_renderSync->mutex);
+    _renderSync->WaitForQtThreadAndBlock(lock);
+  }
 
   if (this->textureDirty)
   {
@@ -342,6 +679,13 @@ void GzRenderer::Render(RenderSync *_renderSync,
     // setting the size should cause the render texture to be rebuilt
     this->dataPtr->camera->PreRender();
     this->textureDirty = false;
+
+    if (nativeWayland && this->dataPtr->nativeWindow)
+    {
+      this->dataPtr->nativeWindow->RequestResolution(
+          this->textureSize.width(), this->textureSize.height());
+      this->dataPtr->nativeWindow->NotifyWindowMovedOrResized();
+    }
 
     // TODO(anyone) See SwapFromThread comments
     // _renderSync->ReleaseQtThreadFromBlock(lock);
@@ -362,6 +706,18 @@ void GzRenderer::Render(RenderSync *_renderSync,
 
   // update and render to texture
   this->dataPtr->camera->Update();
+
+  if (nativeWayland && this->dataPtr->nativeWindow)
+  {
+    static bool loggedNativeDraw = false;
+    if (!loggedNativeDraw)
+    {
+      gzdbg << "Presenting camera output through native Wayland window."
+            << std::endl;
+      loggedNativeDraw = true;
+    }
+    this->dataPtr->nativeWindow->Draw(this->dataPtr->camera);
+  }
 
   if (!this->cameraViewController.empty())
   {
@@ -391,7 +747,9 @@ void GzRenderer::Render(RenderSync *_renderSync,
         gz::gui::App()->findChild<gz::gui::MainWindow *>(),
         new gui::events::Render());
   }
-  _renderSync->ReleaseQtThreadFromBlock(lock);
+
+  if (!nativeWayland)
+    _renderSync->ReleaseQtThreadFromBlock(lock);
 }
 
 /////////////////////////////////////////////////
@@ -666,6 +1024,8 @@ std::string GzRenderer::Initialize(RenderThreadRhi &_rhi)
   if (this->initialized)
     return std::string();
 
+  const bool nativeWayland = UseExperimentalNativeWayland();
+
   // Currently only support one engine at a time
   rendering::RenderEngine *engine{nullptr};
   auto loadedEngines = rendering::loadedEngines();
@@ -676,7 +1036,72 @@ std::string GzRenderer::Initialize(RenderThreadRhi &_rhi)
     QQuickWindow *quickWindow =
       gz::gui::App()->findChild<gz::gui::MainWindow *>()->QuickWindow();
 
-    this->dataPtr->rhiParams["winID"] = std::to_string(quickWindow->winId());
+    if (!nativeWayland)
+      this->dataPtr->rhiParams["winID"] = std::to_string(quickWindow->winId());
+
+    if (nativeWayland)
+    {
+      this->dataPtr->rhiParams["nativeWaylandWindow"] = "1";
+
+      const bool haveExternalWaylandHandles =
+          this->dataPtr->rhiParams.find("externalWaylandDisplay") !=
+              this->dataPtr->rhiParams.end() &&
+          this->dataPtr->rhiParams.find("externalWaylandSurface") !=
+              this->dataPtr->rhiParams.end() &&
+          !this->dataPtr->rhiParams["externalWaylandDisplay"].empty() &&
+          !this->dataPtr->rhiParams["externalWaylandSurface"].empty();
+
+      if (haveExternalWaylandHandles)
+      {
+        gzdbg << "Using preconfigured Qt Wayland child surface handles for "
+              << "Ogre embedding."
+              << " display="
+              << this->dataPtr->rhiParams["externalWaylandDisplay"]
+              << " surface="
+              << this->dataPtr->rhiParams["externalWaylandSurface"]
+              << std::endl;
+      }
+      else
+      {
+        const auto waylandHandles = GetNativeWaylandHandles(quickWindow);
+        if (waylandHandles.Valid())
+        {
+          this->dataPtr->rhiParams["externalWaylandDisplay"] =
+              std::to_string(
+                  reinterpret_cast<uintptr_t>(waylandHandles.display));
+          this->dataPtr->rhiParams["externalWaylandSurface"] =
+              std::to_string(
+                  reinterpret_cast<uintptr_t>(waylandHandles.surface));
+          gzdbg << "Using Qt Wayland native handles for Ogre window "
+                << "embedding."
+                << " display=" << waylandHandles.display
+                << " surface=" << waylandHandles.surface
+                << std::endl;
+        }
+        else
+        {
+          gzwarn << "Qt Wayland native handles were not available. Falling "
+                 << "back to Ogre-owned native Wayland window."
+                 << std::endl;
+        }
+      }
+
+      gzdbg << "Using experimental native Wayland Ogre window path."
+            << std::endl;
+    }
+
+    gzdbg << "MinimalScene render params:"
+          << " useCurrentGLContext="
+          << this->dataPtr->rhiParams["useCurrentGLContext"]
+          << " nativeWaylandWindow="
+          << this->dataPtr->rhiParams["nativeWaylandWindow"]
+          << " externalWaylandDisplay="
+          << this->dataPtr->rhiParams["externalWaylandDisplay"]
+          << " externalWaylandSurface="
+          << this->dataPtr->rhiParams["externalWaylandSurface"]
+          << " winID="
+          << this->dataPtr->rhiParams["winID"]
+          << std::endl;
 
 #if QT_VERSION >= QT_VERSION_CHECK(5, 15, 2) && QT_CONFIG(vulkan) && \
     defined(GZ_RENDERING_HAVE_VULKAN)
@@ -784,6 +1209,26 @@ std::string GzRenderer::Initialize(RenderThreadRhi &_rhi)
   // Update the render interface (texture)
   _rhi.Update(this->dataPtr->camera);
 
+  if (nativeWayland)
+  {
+    this->dataPtr->nativeWindow = engine->CreateNativeWindow(
+        std::string(), this->textureSize.width(), this->textureSize.height(),
+        1.0);
+    if (!this->dataPtr->nativeWindow)
+    {
+      return "Failed to create native render window for experimental "
+             "Wayland mode.";
+    }
+    gzdbg << "Created native render window wrapper for experimental "
+          << "Wayland mode." << std::endl;
+
+    this->dataPtr->nativeWindow->NotifyVisible(true);
+    this->dataPtr->nativeWindow->NotifyFocused(true);
+    this->dataPtr->nativeWindow->RequestResolution(
+        this->textureSize.width(), this->textureSize.height());
+    this->dataPtr->nativeWindow->NotifyWindowMovedOrResized();
+  }
+
   // Ray Query
   this->dataPtr->rayQuery = this->dataPtr->camera->Scene()->CreateRayQuery();
 
@@ -800,7 +1245,8 @@ void GzRenderer::SetGraphicsAPI(const rendering::GraphicsAPI &_graphicsAPI)
   if (_graphicsAPI == rendering::GraphicsAPI::OPENGL)
   {
     gzdbg << "Creating gz-rendering interface for OpenGL" << std::endl;
-    this->dataPtr->rhiParams["useCurrentGLContext"] = "1";
+    if (!UseExperimentalNativeWayland())
+      this->dataPtr->rhiParams["useCurrentGLContext"] = "1";
     this->dataPtr->rhi = std::make_unique<GzCameraTextureRhiOpenGL>();
   }
   else if (_graphicsAPI == rendering::GraphicsAPI::VULKAN)
@@ -825,6 +1271,23 @@ void GzRenderer::SetGraphicsAPI(const rendering::GraphicsAPI &_graphicsAPI)
 }
 
 /////////////////////////////////////////////////
+void GzRenderer::SetExternalWaylandHandles(void *_display, void *_surface)
+{
+  if (_display && _surface)
+  {
+    this->dataPtr->rhiParams["externalWaylandDisplay"] =
+        std::to_string(reinterpret_cast<uintptr_t>(_display));
+    this->dataPtr->rhiParams["externalWaylandSurface"] =
+        std::to_string(reinterpret_cast<uintptr_t>(_surface));
+  }
+  else
+  {
+    this->dataPtr->rhiParams.erase("externalWaylandDisplay");
+    this->dataPtr->rhiParams.erase("externalWaylandSurface");
+  }
+}
+
+/////////////////////////////////////////////////
 void GzRenderer::Destroy()
 {
   auto engine = rendering::engine(this->engineName);
@@ -845,6 +1308,7 @@ void GzRenderer::Destroy()
   }
 
   // clean up in the rendering thread
+  this->dataPtr->nativeWindow.reset();
   this->dataPtr->camera.reset();
   this->dataPtr->rayQuery.reset();
 }
@@ -912,11 +1376,20 @@ void RenderThread::RenderNext(RenderSync *_renderSync)
   emit this->TextureReady(
     this->rhi->TexturePtr(),
     this->rhi->TextureSize());
+
+  if (this->continuousRendering)
+  {
+    QMetaObject::invokeMethod(this, "RenderNext",
+        Qt::QueuedConnection,
+        Q_ARG(RenderSync*, nullptr));
+  }
 }
 
 /////////////////////////////////////////////////
 void RenderThread::ShutDown()
 {
+  this->continuousRendering = false;
+
   // The render interface calls Destroy on GzRendering
   this->rhi->ShutDown();
 
@@ -1012,6 +1485,12 @@ std::string RenderThread::Initialize()
     this->errorCb(QString::fromStdString(loadingError));
   }
   return loadingError;
+}
+
+/////////////////////////////////////////////////
+void RenderThread::SetContinuousRendering(bool _enable)
+{
+  this->continuousRendering = _enable;
 }
 
 /////////////////////////////////////////////////
@@ -1115,7 +1594,7 @@ RenderWindowItem::RenderWindowItem(QQuickItem *_parent)
   : QQuickItem(_parent), dataPtr(utils::MakeUniqueImpl<Implementation>())
 {
   this->setAcceptedMouseButtons(Qt::AllButtons);
-  this->setFlag(ItemHasContents);
+  this->setFlag(ItemHasContents, !UseExperimentalNativeWayland());
   this->dataPtr->renderThread = new RenderThread();
 }
 
@@ -1138,13 +1617,26 @@ void RenderWindowItem::StopRendering()
                             Qt::QueuedConnection);
 
   this->dataPtr->renderThread->wait();
+
+#ifdef GZ_GUI_HAVE_QT5_WAYLAND_CLIENT
+  if (this->dataPtr->waylandSubsurface)
+  {
+    this->dataPtr->waylandSubsurface->Destroy();
+    this->dataPtr->waylandSubsurface.reset();
+  }
+#endif
 }
 
-/////////////////////////////////////////////////
 // This slot will run on the main thread
 void RenderWindowItem::Ready()
 {
-  if (this->dataPtr->graphicsAPI == rendering::GraphicsAPI::OPENGL
+  const bool nativeWayland = UseExperimentalNativeWayland();
+
+  gzdbg << "RenderWindowItem::Ready nativeWayland=" << nativeWayland
+        << std::endl;
+
+  if (!nativeWayland &&
+      this->dataPtr->graphicsAPI == rendering::GraphicsAPI::OPENGL
 #if QT_VERSION < QT_VERSION_CHECK(5, 15, 2) && QT_CONFIG(vulkan) && \
     defined(GZ_RENDERING_HAVE_VULKAN)
       // Use fallback (GPU -> CPU -> GPU)
@@ -1158,13 +1650,17 @@ void RenderWindowItem::Ready()
     this->dataPtr->renderThread->Surface()->create();
   }
 
-  // Carry out initialization on main thread before moving to render thread
-  if (!this->dataPtr->renderThread->Initialize().empty())
+  // The native Wayland path owns its own window/context and does not need
+  // the Qt-driven main-thread bootstrap. Initialize it on the render thread
+  // so all subsequent GL work stays on one thread.
+  if (!nativeWayland &&
+      !this->dataPtr->renderThread->Initialize().empty())
   {
     return;
   }
 
-  if (this->dataPtr->graphicsAPI == rendering::GraphicsAPI::OPENGL
+  if (!nativeWayland &&
+      this->dataPtr->graphicsAPI == rendering::GraphicsAPI::OPENGL
 #if QT_VERSION < QT_VERSION_CHECK(5, 15, 2) && QT_CONFIG(vulkan) && \
     defined(GZ_RENDERING_HAVE_VULKAN)
       // Use fallback (GPU -> CPU -> GPU)
@@ -1188,10 +1684,114 @@ void RenderWindowItem::Ready()
   this->connect(this, &QQuickItem::heightChanged,
       this->dataPtr->renderThread, &RenderThread::SizeChanged);
 
+#ifdef GZ_GUI_HAVE_QT5_WAYLAND_CLIENT
+  auto syncWaylandSubsurface = [this]()
+  {
+    if (UseExperimentalNativeWayland() &&
+        this->dataPtr->waylandSubsurface &&
+        this->dataPtr->waylandSubsurface->Valid())
+    {
+      QQuickWindow *quickWindow =
+          gz::gui::App()->findChild<gz::gui::MainWindow *>()->QuickWindow();
+      bool placeAboveParent = true;
+      if (quickWindow)
+      {
+        QQuickItem *focusItem = quickWindow->activeFocusItem();
+        if (focusItem)
+        {
+          const bool focusInsideViewport =
+              focusItem == this || this->isAncestorOf(focusItem);
+          const bool yieldToQtPopup =
+              !focusInsideViewport && IsPopupLikeObject(focusItem);
+          placeAboveParent = !yieldToQtPopup;
+        }
+      }
+
+      this->dataPtr->waylandSubsurface->SetPlaceAboveParent(placeAboveParent);
+      this->dataPtr->waylandSubsurface->Sync(this);
+    }
+  };
+
+  this->dataPtr->connections << this->connect(this, &QQuickItem::xChanged,
+      this, syncWaylandSubsurface);
+  this->dataPtr->connections << this->connect(this, &QQuickItem::yChanged,
+      this, syncWaylandSubsurface);
+  this->dataPtr->connections << this->connect(this, &QQuickItem::widthChanged,
+      this, syncWaylandSubsurface);
+  this->dataPtr->connections << this->connect(this, &QQuickItem::heightChanged,
+      this, syncWaylandSubsurface);
+  if (auto *quickWindow =
+      gz::gui::App()->findChild<gz::gui::MainWindow *>()->QuickWindow())
+  {
+    this->dataPtr->connections << this->connect(quickWindow,
+        &QQuickWindow::activeFocusItemChanged, this, syncWaylandSubsurface);
+  }
+#endif
+
   this->dataPtr->renderThread->start();
+  this->dataPtr->renderThread->SetContinuousRendering(
+      UseExperimentalNativeWayland());
   this->dataPtr->initializing = false;
   this->dataPtr->initialized = true;
-  this->update();
+
+  if (UseExperimentalNativeWayland())
+  {
+    gzdbg << "Starting native Wayland standalone render loop."
+          << std::endl;
+    QMetaObject::invokeMethod(this->dataPtr->renderThread, "RenderNext",
+        Qt::QueuedConnection,
+        Q_ARG(RenderSync*, nullptr));
+  }
+  else
+  {
+    this->update();
+  }
+}
+
+/////////////////////////////////////////////////
+void RenderWindowItem::StartExperimentalNativeWayland()
+{
+  if (!UseExperimentalNativeWayland() ||
+      this->dataPtr->initialized ||
+      this->dataPtr->initializing)
+  {
+    return;
+  }
+
+  gzdbg << "Bootstrapping experimental native Wayland render window."
+        << std::endl;
+
+  this->dataPtr->initializing = true;
+  this->dataPtr->renderThread->SetGraphicsAPI(this->dataPtr->graphicsAPI);
+
+#ifdef GZ_GUI_HAVE_QT5_WAYLAND_CLIENT
+  if (!this->dataPtr->waylandSubsurface)
+    this->dataPtr->waylandSubsurface = std::make_unique<WaylandSubsurface>();
+
+  QQuickWindow *quickWindow =
+      gz::gui::App()->findChild<gz::gui::MainWindow *>()->QuickWindow();
+
+  if (this->dataPtr->waylandSubsurface->Create(quickWindow, this))
+  {
+    const auto waylandHandles = this->dataPtr->waylandSubsurface->Handles();
+    this->dataPtr->renderThread->gzRenderer.SetExternalWaylandHandles(
+        waylandHandles.display, waylandHandles.surface);
+    gzdbg << "Created Qt Wayland child subsurface for Ogre embedding."
+          << " display=" << waylandHandles.display
+          << " surface=" << waylandHandles.surface
+          << std::endl;
+  }
+  else
+  {
+    gzwarn << "Unable to create Qt Wayland child subsurface. Falling back "
+           << "to Ogre-owned native Wayland window."
+           << std::endl;
+    this->dataPtr->renderThread->gzRenderer.SetExternalWaylandHandles(
+        nullptr, nullptr);
+  }
+#endif
+
+  QMetaObject::invokeMethod(this, "Ready", Qt::QueuedConnection);
 }
 
 /////////////////////////////////////////////////
@@ -1207,6 +1807,13 @@ QSGNode *RenderWindowItem::updatePaintNode(QSGNode *_node,
     {
       return nullptr;
     }
+
+    if (UseExperimentalNativeWayland())
+    {
+      this->StartExperimentalNativeWayland();
+      return nullptr;
+    }
+
     this->dataPtr->initializing = true;
 
     // Set the render thread's render system
@@ -1253,6 +1860,18 @@ QSGNode *RenderWindowItem::updatePaintNode(QSGNode *_node,
              << rendering::GraphicsAPIUtils::Str(this->dataPtr->graphicsAPI)
              << "] is not supported"
              << std::endl;
+    }
+    return nullptr;
+  }
+
+  if (UseExperimentalNativeWayland())
+  {
+    static bool loggedOnce = false;
+    if (!loggedOnce)
+    {
+      gzdbg << "Skipping embedded Qt texture node for experimental native "
+            << "Wayland mode." << std::endl;
+      loggedOnce = true;
     }
     return nullptr;
   }
@@ -1569,6 +2188,13 @@ void MinimalScene::LoadConfig(const tinyxml2::XMLElement *_pluginElem)
   }
 
   renderWindow->SetEngineName(cmdRenderEngine);
+
+  if (UseExperimentalNativeWayland())
+  {
+    gzdbg << "MinimalScene native Wayland mode enabled; RenderWindow will "
+          << "bootstrap outside the Qt texture node path." << std::endl;
+    renderWindow->StartExperimentalNativeWayland();
+  }
 }
 
 /////////////////////////////////////////////////

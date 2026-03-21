@@ -34,6 +34,36 @@
 /////////////////////////////////////////////////
 namespace gz::gui::plugins
 {
+  namespace
+  {
+    bool UseExperimentalNativeWayland()
+    {
+      const QByteArray experimental =
+          qgetenv("GZ_EXPERIMENTAL_NATIVE_WAYLAND");
+      const QString platform = QString::fromLocal8Bit(qgetenv("QT_QPA_PLATFORM"));
+      const QString sessionType =
+          QString::fromLocal8Bit(qgetenv("XDG_SESSION_TYPE"));
+      const bool enabled = !experimental.isEmpty() &&
+          platform != "xcb" &&
+          sessionType == "wayland";
+
+      static bool loggedOnce = false;
+      if (!loggedOnce)
+      {
+        gzdbg << "RenderThreadRhiOpenGL native Wayland gate:"
+              << " GZ_EXPERIMENTAL_NATIVE_WAYLAND="
+              << experimental.constData()
+              << " XDG_SESSION_TYPE=" << sessionType.toStdString()
+              << " QT_QPA_PLATFORM=" << platform.toStdString()
+              << " enabled=" << enabled
+              << std::endl;
+        loggedOnce = true;
+      }
+
+      return enabled;
+    }
+  }
+
   class GzCameraTextureRhiOpenGLPrivate
   {
     public: int textureId = 0;
@@ -114,10 +144,18 @@ void RenderThreadRhiOpenGL::SetContext(QOpenGLContext *_context)
 /////////////////////////////////////////////////
 std::string RenderThreadRhiOpenGL::Initialize()
 {
-  this->dataPtr->context->makeCurrent(this->dataPtr->surface);
+  if (!UseExperimentalNativeWayland())
+  {
+    this->dataPtr->context->makeCurrent(this->dataPtr->surface);
 
-  this->dataPtr->engineToQtInterface.reset(
-    new EngineToQtInterface(this->dataPtr->context));
+    this->dataPtr->engineToQtInterface.reset(
+      new EngineToQtInterface(this->dataPtr->context));
+  }
+  else
+  {
+    gzdbg << "Skipping Qt OpenGL context bridge for experimental native "
+          << "Wayland mode." << std::endl;
+  }
 
   auto loadingError = this->dataPtr->renderer->Initialize(*this);
   if (!loadingError.empty())
@@ -125,13 +163,21 @@ std::string RenderThreadRhiOpenGL::Initialize()
     return loadingError;
   }
 
-  this->dataPtr->context->doneCurrent();
+  if (!UseExperimentalNativeWayland())
+    this->dataPtr->context->doneCurrent();
+
   return std::string();
 }
 
 /////////////////////////////////////////////////
 void RenderThreadRhiOpenGL::Update(rendering::CameraPtr _camera)
 {
+  if (UseExperimentalNativeWayland())
+  {
+    this->dataPtr->texturePtr = nullptr;
+    return;
+  }
+
   const GLuint glId = this->dataPtr->engineToQtInterface->TextureId(_camera);
   this->dataPtr->texturePtr = reinterpret_cast<void *>(
     static_cast<intptr_t>(glId));
@@ -140,7 +186,8 @@ void RenderThreadRhiOpenGL::Update(rendering::CameraPtr _camera)
 /////////////////////////////////////////////////
 void RenderThreadRhiOpenGL::RenderNext(RenderSync *_renderSync)
 {
-  this->dataPtr->context->makeCurrent(this->dataPtr->surface);
+  if (!UseExperimentalNativeWayland())
+    this->dataPtr->context->makeCurrent(this->dataPtr->surface);
 
   if (!this->dataPtr->renderer->initialized)
   {
@@ -156,7 +203,8 @@ void RenderThreadRhiOpenGL::RenderNext(RenderSync *_renderSync)
   // Call the renderer
   this->dataPtr->renderer->Render(_renderSync, *this);
 
-  this->dataPtr->context->doneCurrent();
+  if (!UseExperimentalNativeWayland())
+    this->dataPtr->context->doneCurrent();
 }
 
 /////////////////////////////////////////////////
